@@ -13,7 +13,6 @@ use crate::mxc_common::filesystem_resolve::FsIntent;
 #[cfg(any(target_os = "linux", test))]
 use crate::mxc_common::models::ContainerPolicy;
 use crate::mxc_common::models::{ExecutionRequest, NetworkAction, ProxyAddress};
-use crate::mxc_common::proxy_env::{is_managed_proxy_key, PROXY_SET_KEYS};
 
 /// The fixed prefix of the command bwrap is asked to run.
 ///
@@ -210,24 +209,21 @@ pub fn directional_network_rejection(request: &ExecutionRequest) -> Option<&'sta
 }
 
 /// Rejection text for an inbound-accepting directional posture.
-pub const BWRAP_INGRESS_DEFAULT_ALLOW: &str =
-    "Bubblewrap: network.ingress.default='allow' is not supported. The sandbox runs in a \
+pub const BWRAP_INGRESS_DEFAULT_ALLOW: &str = "Bubblewrap: network.ingress.default='allow' is not supported. The sandbox runs in a \
      private network namespace reached through slirp, which has no route in until a host \
      port is forwarded to it, and the schema carries no port list to forward. A listener \
      inside the sandbox is reachable from the sandbox only. Use \
      network.ingress.default='deny'.";
 
 /// Rejection text for an inbound-accepting host-loopback posture.
-pub const BWRAP_HOST_LOOPBACK_ALLOW: &str =
-    "Bubblewrap: network.ingress.hostLoopback='allow' is not supported. The sandbox's \
+pub const BWRAP_HOST_LOOPBACK_ALLOW: &str = "Bubblewrap: network.ingress.hostLoopback='allow' is not supported. The sandbox's \
      loopback belongs to its own network namespace and is not the host's, so the host \
      cannot dial a sandbox listener and nothing bridges the two. Use \
      network.ingress.hostLoopback='deny'.";
 
 /// Rejection text for a proxy combined with direct egress.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) const BWRAP_PROXY_DIRECTIONAL_EGRESS: &str =
-    "Bubblewrap: runtimeConfig.networkProxy cannot be combined with direct network.egress rules \
+pub(crate) const BWRAP_PROXY_DIRECTIONAL_EGRESS: &str = "Bubblewrap: runtimeConfig.networkProxy cannot be combined with direct network.egress rules \
      or default='allow'. \
      A proxy resolves to proxy-only egress, whose chain opens the proxy endpoint alone and \
      never reads network.egress, so the rules would be dropped in silence. Use \
@@ -379,8 +375,8 @@ pub fn build_args(request: &ExecutionRequest, proxy_address: Option<&ProxyAddres
 ///   plus slirp-backed connectivity,
 /// - strips any caller-supplied `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` /
 ///   `FTP_PROXY` / `NO_PROXY` entries from `request.env`,
-/// - emits `--setenv` for the proxy keys (all but `NO_PROXY`) pointing at the
-///   proxy URL.
+/// - emits `--setenv` for the proxy keys pointing at the proxy URL and clears
+///   both `NO_PROXY` and `no_proxy` explicitly.
 ///
 /// `denied_files` is the set of `deniedPaths` entries the runner classified as
 /// files (built by `symlink_metadata`-probing each denied path, so this function
@@ -392,7 +388,13 @@ pub fn build_args_classified(
     denied_files: &HashSet<String>,
 ) -> Vec<String> {
     let network_mode = ResolvedNetworkMode::from_request(request, proxy_address.is_some());
-    build_args_classified_with_mode(request, proxy_address, denied_files, network_mode)
+    build_args_classified_with_mode(
+        request,
+        proxy_address,
+        denied_files,
+        network_mode,
+        crate::mxc_common::sandbox_process::StdioMode::Pipes,
+    )
 }
 
 /// Build Bubblewrap arguments using a previously resolved network mode.
@@ -401,6 +403,7 @@ pub(crate) fn build_args_classified_with_mode(
     proxy_address: Option<&ProxyAddress>,
     denied_files: &HashSet<String>,
     network_mode: ResolvedNetworkMode,
+    stdio: crate::mxc_common::sandbox_process::StdioMode,
 ) -> Vec<String> {
     // -- Namespace isolation (all unshared by default) ---------------------
     let mut args = Vec::new();
@@ -472,7 +475,11 @@ pub(crate) fn build_args_classified_with_mode(
             // Read-only: already covered by the base ro-bind, but listed
             // explicitly so the intent is clear and it overrides any rw parent.
             FsIntent::ReadOnly => {
-                args.extend(["--ro-bind".into(), mount.path.clone(), mount.path.clone()]);
+                args.extend([
+                    "--ro-bind-try".into(),
+                    mount.path.clone(),
+                    mount.path.clone(),
+                ]);
             }
             FsIntent::Denied => {
                 if denied_files.contains(&mount.path) {
@@ -484,37 +491,53 @@ pub(crate) fn build_args_classified_with_mode(
         }
     }
 
+    if request
+        .policy
+        .readonly_paths
+        .iter()
+        .chain(&request.policy.readwrite_paths)
+        .any(|path| path == "/")
+    {
+        for (flag, path) in [("--proc", "/proc"), ("--dev", "/dev")] {
+            if !request
+                .policy
+                .denied_paths
+                .iter()
+                .any(|denied| path == denied || path.starts_with(&format!("{denied}/")))
+            {
+                args.extend([flag.into(), path.into()]);
+            }
+        }
+    }
+    for hidden in &request.policy.denied_paths {
+        if !denied_files.contains(hidden) {
+            args.extend(["--remount-ro".into(), hidden.clone()]);
+        }
+    }
+    // A caller-owned PTY already has a private session. Detaching again removes
+    // the workload's controlling terminal and disables interactive job control.
+    // Inherited terminal input still needs separation from the host's session.
+    if !matches!(stdio, crate::mxc_common::sandbox_process::StdioMode::Pty(_)) {
+        args.push("--new-session".into());
+    }
+
     // -- Working directory -------------------------------------------------
     if let Some(dir) = start_directory(request) {
         args.extend(["--chdir".into(), dir]);
     }
 
-    // -- Environment -------------------------------------------------------
-    // Clear the inherited environment, then set only the vars from the
-    // request so the sandbox has a minimal, predictable environment.
+    // Bind the complete environment to the namespace-visible proxy endpoint.
     args.push("--clearenv".into());
-    for env_str in resolved_env(request) {
-        // An entry with no `=` names no variable, so it is dropped here too.
-        if let Some((key, value)) = env_str.split_once('=') {
-            // When the proxy is active, drop any caller-supplied proxy env
-            // entries so they cannot override the values we set below.
-            if proxy_address.is_some() && is_managed_proxy_key(key) {
-                continue;
-            }
-            args.extend(["--setenv".into(), key.into(), value.into()]);
+    let resolved = resolved_env(request);
+    let env = match proxy_address {
+        Some(address) => {
+            crate::mxc_common::proxy_env::apply_cooperative_proxy_env(&resolved, &address.to_url())
         }
-    }
-
-    // -- Network proxy env vars -------------------------------------------
-    // Cooperating tools route through the externally managed proxy; raw
-    // sockets cannot bypass the namespace-local default-DROP chain.
-    //
-    // We deliberately do NOT set NO_PROXY here. Exempting any destination
-    // would let cooperating clients bypass the configured proxy policy.
-    if let Some(addr) = proxy_address {
-        let url = addr.to_url();
-        for key in PROXY_SET_KEYS {
-            args.extend(["--setenv".into(), (*key).into(), url.clone()]);
+        None => resolved,
+    };
+    for entry in env {
+        if let Some((key, value)) = entry.split_once('=') {
+            args.extend(["--setenv".into(), key.into(), value.into()]);
         }
     }
 
@@ -1110,11 +1133,10 @@ mod tests {
         assert_eq!(args[rw_pos + 1], "/workspace");
         assert_eq!(args[rw_pos + 2], "/workspace");
 
-        // ro — baseline paths are emitted via --ro-bind-try, so a bare
-        // --ro-bind must correspond to the user's readonlyPaths entry.
+        // Match the exact policy path because baseline mounts use the same flag.
         args.windows(3)
-            .position(|w| w[0] == "--ro-bind" && w[1] == "/data" && w[2] == "/data")
-            .expect("readonly policy path /data should produce a --ro-bind mount");
+            .position(|w| w[0] == "--ro-bind-try" && w[1] == "/data" && w[2] == "/data")
+            .expect("readonly policy path /data should produce a --ro-bind-try mount");
 
         // denied
         let tmpfs_positions: Vec<_> = args
@@ -1352,7 +1374,7 @@ mod tests {
         };
 
         assert_after("--bind", "/tmp/workspace");
-        assert_after("--ro-bind", "/tmp/data");
+        assert_after("--ro-bind-try", "/tmp/data");
         assert_after("--tmpfs", "/tmp/secrets");
     }
 
@@ -1409,11 +1431,14 @@ mod tests {
         let addr = ProxyAddress::new("127.0.0.1".into(), 7777);
         let args = build_args(&r, Some(&addr));
 
-        assert!(
-            !args.iter().any(|a| a == "NO_PROXY" || a == "no_proxy"),
-            "proxy mode must not emit NO_PROXY/no_proxy --setenv pairs: {:?}",
-            args,
-        );
+        for key in ["NO_PROXY", "no_proxy"] {
+            let values = args
+                .windows(3)
+                .filter(|entry| entry[0] == "--setenv" && entry[1] == key)
+                .map(|entry| entry[2].as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(values, vec![""], "proxy bypass must be cleared for {key}");
+        }
     }
 
     #[test]
@@ -1427,6 +1452,7 @@ mod tests {
             "FTP_PROXY=http://attacker.example:9999".into(),
             "ftp_proxy=http://attacker.example:9999".into(),
             "NO_PROXY=*".into(),
+            "no_proxy=localhost,127.0.0.1".into(),
             "PATH=/usr/bin".into(),
         ]);
         let addr = ProxyAddress::new("127.0.0.1".into(), 9000);
@@ -1456,13 +1482,14 @@ mod tests {
             assert_eq!(args[pos + 1], "http://127.0.0.1:9000");
         }
 
-        // Bypass variables remain absent after clearing the caller's
-        // environment.
+        // Neither a wildcard nor a loopback exception may survive the handoff.
         for key in ["NO_PROXY", "no_proxy"] {
-            assert!(
-                !args.iter().any(|arg| arg == key),
-                "proxy mode must not emit caller-controlled {key}: {args:?}"
-            );
+            let values = args
+                .windows(3)
+                .filter(|entry| entry[0] == "--setenv" && entry[1] == key)
+                .map(|entry| entry[2].as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(values, vec![""], "proxy bypass must be cleared for {key}");
         }
     }
 

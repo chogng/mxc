@@ -611,6 +611,16 @@ impl LivePty {
         }
     }
 
+    /// Signal the current terminal foreground group. Shell jobs may have their own group,
+    /// so the child leader's PID cannot identify the recipient of an interactive interrupt.
+    pub fn interrupt(&self) -> std::io::Result<()> {
+        let group = unsafe { libc::tcgetpgrp(self.primary.as_raw_fd()) };
+        if group <= 0 || unsafe { libc::kill(-group, libc::SIGINT) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Resize the pseudo-terminal and notify its foreground process group.
     pub fn resize(&self, size: PtySize) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;

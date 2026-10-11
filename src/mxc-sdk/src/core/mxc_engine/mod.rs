@@ -153,7 +153,7 @@ fn spawn_execution_request_with_logger(
     spawn_execution_request_with_logger_and(request, logger, dispatch::spawn_runner)
 }
 
-fn spawn_execution_request_with_logger_and(
+pub(crate) fn spawn_execution_request_with_logger_and(
     request: &ExecutionRequest,
     mut logger: Logger,
     spawn: impl FnOnce(&ExecutionRequest, &mut Logger) -> Result<Box<dyn SandboxProcess>, MxcError>,

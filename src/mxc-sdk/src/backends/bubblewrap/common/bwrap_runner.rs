@@ -22,16 +22,16 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::mxc_common::interruptible_reader::{wrap_pipe, InterruptibleReader, ReadCanceller};
+use crate::mxc_common::interruptible_reader::{InterruptibleReader, ReadCanceller, wrap_pipe};
 use crate::mxc_common::logger::Logger;
 use crate::mxc_common::models::{ExecutionRequest, ScriptResponse};
 use crate::mxc_common::sandbox_process::{
+    NativeStdio, PtySize, SandboxBackend, SandboxProcess, StdioMode, StreamCloser, WaitError,
     boxed_closer, cancel_and_join_discard, duplicate_and_take_native_stdio, group_kill,
-    spawn_discard, take_boxed_read, take_boxed_write, wait_with_timeout, NativeStdio, PtySize,
-    SandboxBackend, SandboxProcess, StdioMode, StreamCloser, WaitError,
+    spawn_discard, take_boxed_read, take_boxed_write, wait_with_timeout,
 };
 use crate::mxc_common::validator::{
-    validate_common, validate_network_policy_support, NetworkPolicySupport,
+    NetworkPolicySupport, validate_common, validate_network_policy_support,
 };
 use crate::mxc_pty::{LivePty, PtySize as UnixPtySize};
 
@@ -164,7 +164,10 @@ impl BubblewrapScriptRunner {
         // Execution validation deliberately bypasses the advisory success
         // cache: a prior platform-support query must not approve a different
         // executable after `PATH` or its contents change.
-        self.validate_prepared_with_probe(request, bwrap_version::probe_bwrap_uncached)
+        self.validate_prepared_with_probe(request, || match &request.bubblewrap_executable {
+            Some(path) => bwrap_version::probe_bwrap_at(path),
+            None => bwrap_version::probe_bwrap_uncached(),
+        })
     }
 
     /// `validate_prepared` with an injectable environment probe.
@@ -404,6 +407,11 @@ impl BubblewrapScriptRunner {
         logger: &mut Logger,
         stdio: StdioMode,
     ) -> Result<BwrapChild, ScriptResponse> {
+        let socket_filter = crate::bwrap_common::seccomp::SocketFilter::new().map_err(|error| {
+            ScriptResponse::error(&format!(
+                "Bubblewrap: failed to create socket filter: {error}"
+            ))
+        })?;
         // The caller manages the proxy; pass its address into the sandbox
         // environment and restrict direct egress to that endpoint.
         let configured_proxy = request.policy.network_proxy.address.as_ref();
@@ -484,6 +492,7 @@ impl BubblewrapScriptRunner {
             proxy_address,
             denied_files,
             network_mode,
+            stdio,
         );
         let mut network_startup = match proxy_network.as_ref() {
             Some(network) => match network.configure_bwrap(&mut args, logger) {
@@ -501,8 +510,14 @@ impl BubblewrapScriptRunner {
             args.len()
         );
 
-        // 3. Spawn `bwrap`.
-        let mut command = Command::new("bwrap");
+        // 3. Spawn `bwrap` with the host-selected executable and inherited filter.
+        let mut command = Command::new(
+            request
+                .bubblewrap_executable
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("bwrap")),
+        );
+        socket_filter.configure(&mut command);
         command.args(&args);
         let pty = match stdio {
             StdioMode::Pipes => {
@@ -648,8 +663,8 @@ impl BubblewrapScriptRunner {
 /// A spawned `bwrap` sandbox: the child process, its parent-side pipe ends,
 /// and the per-run private network state torn down once it exits.
 struct BwrapChild {
-    /// The lock is what keeps [`ProviderMonitor`]'s thread from signalling a
-    /// pid this side has already reaped.
+    /// Exit observation leaves the leader unreaped until the monitor is joined
+    /// and the process group is terminated, keeping its PID reserved throughout.
     child: Arc<Mutex<Child>>,
     stdin: Option<ChildStdin>,
     stdout: Option<InterruptibleReader>,
@@ -692,6 +707,7 @@ impl BwrapChild {
 /// [`BwrapChild`] (child, pipes, and per-run network state), tearing the network
 /// state down once the child exits.
 struct BubblewrapSandboxProcess {
+    reaped: bool,
     inner: BwrapChild,
     teardown_done: bool,
 }
@@ -700,6 +716,7 @@ impl BubblewrapSandboxProcess {
     fn new(child: BwrapChild) -> Self {
         Self {
             inner: child,
+            reaped: false,
             teardown_done: false,
         }
     }
@@ -726,24 +743,49 @@ impl BubblewrapSandboxProcess {
         const MIN_POLL: Duration = Duration::from_millis(1);
         const MAX_POLL: Duration = Duration::from_millis(50);
 
+        if self.reaped {
+            return match self.inner.lock_child().wait() {
+                Ok(status) => BwrapOutcome::Exited(status),
+                Err(error) => BwrapOutcome::Io(error),
+            };
+        }
+
         let deadline = self
             .inner
             .timeout
             .map(|timeout| self.inner.started + timeout);
         let mut interval = MIN_POLL;
         loop {
-            let exited = match self.inner.lock_child().try_wait() {
-                Ok(exited) => exited,
-                Err(error) => return BwrapOutcome::Io(error),
-            };
+            let exited =
+                match crate::mxc_common::sandbox_process::poll_child_exit(&self.inner.lock_child())
+                {
+                    Ok(exited) => exited,
+                    Err(error) => return BwrapOutcome::Io(error),
+                };
             // Checked after the exit rather than before it: the monitor kills
             // the sandbox, so a provider death shows up here as an ordinary
             // exit that would otherwise be reported as the workload's own.
             if self.provider_lost() {
                 return BwrapOutcome::ProviderLost;
             }
-            if let Some(status) = exited {
-                return BwrapOutcome::Exited(status);
+            if exited.is_some() {
+                // Join the monitor before reaping so it cannot inspect a PID
+                // after the leader's ownership has ended.
+                let lost = self
+                    .inner
+                    .monitor
+                    .take()
+                    .is_some_and(|mut monitor| monitor.disarm());
+                if lost {
+                    return BwrapOutcome::ProviderLost;
+                }
+                if let Err(error) = self.kill() {
+                    return BwrapOutcome::Io(error);
+                }
+                return match self.inner.lock_child().wait() {
+                    Ok(status) => BwrapOutcome::Exited(status),
+                    Err(error) => BwrapOutcome::Io(error),
+                };
             }
 
             let now = Instant::now();
@@ -838,6 +880,14 @@ impl SandboxProcess for BubblewrapSandboxProcess {
             .take_writer()
     }
 
+    fn pty_interrupt(&self) -> std::io::Result<()> {
+        self.inner
+            .pty
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("process has no PTY"))?
+            .interrupt()
+    }
+
     fn pty_resize(&self, size: PtySize) -> std::io::Result<()> {
         self.inner
             .pty
@@ -892,8 +942,16 @@ impl SandboxProcess for BubblewrapSandboxProcess {
                 "Bubblewrap: script timed out",
             ));
         }
-        if let Some(status) = self.inner.lock_child().try_wait()? {
-            return Ok(Some(status.code().unwrap_or(-1)));
+        let status = if self.reaped {
+            self.inner
+                .lock_child()
+                .try_wait()?
+                .map(|status| status.code().unwrap_or(-1))
+        } else {
+            crate::mxc_common::sandbox_process::poll_child_exit(&self.inner.lock_child())?
+        };
+        if status.is_some() {
+            return Ok(status);
         }
         if self
             .inner
@@ -925,10 +983,10 @@ impl SandboxProcess for BubblewrapSandboxProcess {
         // No-op once the child has exited and been reaped: its pid/pgid can be
         // recycled, so signaling it could hit an unrelated process (group). A
         // reaped `Child` returns its cached status here without a syscall.
-        let mut child = self.inner.lock_child();
-        if child.try_wait()?.is_some() {
+        if self.reaped {
             return Ok(());
         }
+        let mut child = self.inner.lock_child();
         if self.inner.group {
             // Pipes and PTY modes give bwrap its own process group.
             group_kill(&mut child)
@@ -1039,6 +1097,7 @@ impl SandboxProcess for BubblewrapSandboxProcess {
             }
         };
 
+        self.reaped = true;
         cancel_and_join_discard(stdout_thread, &self.inner.stdout_canceller);
         cancel_and_join_discard(stderr_thread, &self.inner.stderr_canceller);
         if let Some(pty) = self.inner.pty.as_ref() {
@@ -1065,6 +1124,10 @@ impl Drop for BubblewrapSandboxProcess {
         self.run_teardown();
     }
 }
+
+#[cfg(test)]
+#[path = "bwrap_runner_tests.rs"]
+mod lifecycle_tests;
 
 /// Tear down the proxy network namespace against the caller's logger.
 ///
@@ -1424,7 +1487,7 @@ mod tests {
         };
 
         use crate::bwrap_common::network_rules::{
-            render_filter_payloads, EgressPlan, IngressPlan, RuleFamily,
+            EgressPlan, IngressPlan, RuleFamily, render_filter_payloads,
         };
 
         // A directional posture makes the gates that key off it fire. Both

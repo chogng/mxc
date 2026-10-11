@@ -140,6 +140,10 @@ impl From<crate::mxc_common::wire::Containment> for ContainmentBackend {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SeatbeltConfig {
+    #[serde(skip)]
+    pub allow_unix_sockets: bool,
+    #[serde(skip)]
+    pub allowed_unix_socket_paths: Vec<String>,
     /// Optional override of the generated TinyScheme profile.
     #[serde(rename = "profileOverride", skip_serializing_if = "Option::is_none")]
     pub profile_override: Option<String>,
@@ -205,6 +209,8 @@ fn default_nested_pty() -> bool {
 impl Default for SeatbeltConfig {
     fn default() -> Self {
         Self {
+            allow_unix_sockets: true,
+            allowed_unix_socket_paths: Vec::new(),
             profile_override: None,
             gui_access: false,
             launch_method: LaunchMethod::default(),
@@ -945,6 +951,8 @@ pub struct HyperlightConfig {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ExecutionRequest {
+    #[serde(skip)]
+    pub bubblewrap_executable: Option<std::path::PathBuf>,
     /// Exact external contract that produced this request.
     ///
     /// Direct typed SDK construction has no external contract attribution.

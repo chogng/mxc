@@ -29,22 +29,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::mxc_common::interruptible_reader::{wrap_pipe, InterruptibleReader, ReadCanceller};
+use crate::mxc_common::interruptible_reader::{InterruptibleReader, ReadCanceller, wrap_pipe};
 use crate::mxc_common::logger::Logger;
 use crate::mxc_common::models::{ExecutionRequest, LaunchMethod, ProxyAddress, ScriptResponse};
 use crate::mxc_common::sandbox_process::{
+    NativeStdio, PtySize, SandboxBackend, SandboxProcess, StdioMode, StreamCloser, WaitError,
     boxed_closer, cancel_and_join_discard, duplicate_and_take_native_stdio, group_kill,
-    spawn_discard, take_boxed_read, take_boxed_write, wait_with_timeout, NativeStdio, PtySize,
-    SandboxBackend, SandboxProcess, StdioMode, StreamCloser, WaitError,
+    spawn_discard, take_boxed_read, take_boxed_write, wait_with_timeout,
 };
 use crate::mxc_common::validator::{
-    validate_common, validate_network_policy_support, NetworkPolicySupport,
+    NetworkPolicySupport, validate_common, validate_network_policy_support,
 };
 use crate::mxc_pty::{LivePty, PtySize as UnixPtySize};
 
 #[cfg(test)]
 use crate::seatbelt_common::default_env::DEFAULT_SANDBOX_PATH;
-use crate::seatbelt_common::default_env::{env_pairs, resolved_env};
+use crate::seatbelt_common::default_env::resolved_env;
 use crate::seatbelt_common::profile_builder::build_profile_with_proxy;
 
 #[link(name = "proc")]
@@ -78,26 +78,8 @@ struct ProcUniqueIdentifierInfo {
 
 const PROC_PID_UNIQUE_IDENTIFIER_INFO: libc::c_int = 17;
 
-/// Env var keys the cooperative proxy manages. When a proxy is active these
-/// are stripped from the caller-supplied environment so sandboxed code cannot
-/// override the `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` values we inject (or
-/// re-enable a `NO_PROXY` bypass). `ALL_PROXY` is the catch-all curl/libcurl
-/// and many HTTP clients honor for every scheme, so leaving it caller-settable
-/// would let sandboxed code redirect or bypass the proxy. Mirrors the
-/// Bubblewrap backend's `PROXY_ENV_KEYS`.
-const PROXY_ENV_KEYS: &[&str] = &[
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "NO_PROXY",
-    "no_proxy",
-];
-
 fn session_kill(child: &mut std::process::Child, session_id: libc::pid_t) -> std::io::Result<()> {
-    let leader_result = match child.try_wait()? {
+    let leader_result = match crate::mxc_common::sandbox_process::poll_child_exit(child)? {
         Some(_) => Ok(()),
         None => child.kill(),
     };
@@ -207,18 +189,6 @@ fn list_all_pids() -> std::io::Result<Vec<libc::pid_t>> {
     pids.truncate((listed as usize).min(pids.len()));
     Ok(pids)
 }
-
-/// Proxy env var keys injected (pointing at the resolved proxy URL) when a
-/// proxy is active. `NO_PROXY` is intentionally absent — see the module docs
-/// and [`resolve_environment`].
-const PROXY_INJECT_KEYS: &[&str] = &[
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-];
 
 // ---------------------------------------------------------------------------
 // FFI declarations for Apple's sandbox API (libsandbox.dylib).
@@ -395,7 +365,7 @@ fn spawn_exec(
         Err(e) => {
             return Err(error_response(format!(
                 "failed to read the current directory to anchor the relative seatbelt working directory: {e}"
-            )))
+            )));
         }
     };
     let home_dir = resolved_cwd.as_ref().map(|_| cwd.as_str());
@@ -460,6 +430,7 @@ fn spawn_exec(
     let session_id =
         (new_session || matches!(stdio, StdioMode::Pty(_))).then_some(child.id() as libc::pid_t);
     Ok(Box::new(SeatbeltSandboxProcess {
+        reaped: false,
         child,
         stdin,
         stdout,
@@ -617,6 +588,7 @@ fn spawn_open(
     // handle's `wait()` (or drop) runs.
     let started = Instant::now();
     Ok(Box::new(SeatbeltSandboxProcess {
+        reaped: false,
         child,
         stdin: None,
         stdout: None,
@@ -637,6 +609,7 @@ fn spawn_open(
 /// A running Seatbelt-sandboxed process: the child plus, for the pipes path,
 /// its parent-side pipe ends. See [`SandboxProcess`] for the contract.
 struct SeatbeltSandboxProcess {
+    reaped: bool,
     child: std::process::Child,
     /// Pipe ends — `Some` only for [`StdioMode::Pipes`]; `None` for inherited
     /// stdio / Open mode (the streams are the binary's own, or detached). The
@@ -738,6 +711,13 @@ impl SandboxProcess for SeatbeltSandboxProcess {
             .take_writer()
     }
 
+    fn pty_interrupt(&self) -> std::io::Result<()> {
+        self.pty
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("process has no PTY"))?
+            .interrupt()
+    }
+
     fn pty_resize(&self, size: PtySize) -> std::io::Result<()> {
         self.pty
             .as_ref()
@@ -790,8 +770,15 @@ impl SandboxProcess for SeatbeltSandboxProcess {
                 "Seatbelt: process timed out",
             ));
         }
-        if let Some(status) = self.child.try_wait()? {
-            return Ok(Some(status.code().unwrap_or(-1)));
+        let status = if self.reaped {
+            self.child
+                .try_wait()?
+                .map(|status| status.code().unwrap_or(-1))
+        } else {
+            crate::mxc_common::sandbox_process::poll_child_exit(&self.child)?
+        };
+        if status.is_some() {
+            return Ok(status);
         }
         if self
             .timeout
@@ -818,14 +805,11 @@ impl SandboxProcess for SeatbeltSandboxProcess {
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
+        if self.reaped {
+            return Ok(());
+        }
         if let Some(session_id) = self.session_id {
             return session_kill(&mut self.child, session_id);
-        }
-        // No-op once the child has exited and been reaped: its pid/pgid can be
-        // recycled, so signaling it could hit an unrelated process (group). A
-        // reaped `Child` returns its cached status here without a syscall.
-        if self.child.try_wait()?.is_some() {
-            return Ok(());
         }
         if self.group {
             // The child leads its own process group — signal the whole group so
@@ -927,6 +911,7 @@ impl SandboxProcess for SeatbeltSandboxProcess {
             }
         };
 
+        self.reaped = true;
         cancel_and_join_discard(stdout_thread, &self.stdout_canceller);
         cancel_and_join_discard(stderr_thread, &self.stderr_canceller);
         if let Some(pty) = self.pty.as_ref() {
@@ -944,6 +929,10 @@ impl Drop for SeatbeltSandboxProcess {
         // the handle is dropped without `wait()`, but never block destruction
         // indefinitely when macOS does not make a signalled child reapable.
         const DROP_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+        if self.reaped {
+            self.run_cleanup();
+            return;
+        }
         if let Some(session_id) = self.session_id {
             let _ = terminate_session_and_reap(&mut self.child, session_id, DROP_REAP_TIMEOUT);
         } else {
@@ -1241,19 +1230,20 @@ fn resolve_environment(
     working_directory: Option<&str>,
 ) -> Vec<(String, String)> {
     let resolved = resolved_env(request, working_directory);
-    let strip_caller_proxy = proxy_address.is_some();
-    let mut pairs: Vec<(String, String)> = env_pairs(&resolved)
-        .into_iter()
-        .filter(|(key, _)| !strip_caller_proxy || !PROXY_ENV_KEYS.contains(key))
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect();
-    if let Some(addr) = proxy_address {
-        let url = addr.to_url();
-        for key in PROXY_INJECT_KEYS {
-            pairs.push((key.to_string(), url.clone()));
+    let entries = match proxy_address {
+        Some(address) => {
+            crate::mxc_common::proxy_env::apply_cooperative_proxy_env(&resolved, &address.to_url())
         }
-    }
-    pairs
+        None => resolved,
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 /// Write `content` to a temp file with a cryptographically random name and the
@@ -1365,9 +1355,11 @@ mod tests {
         let addr = ProxyAddress::new("127.0.0.1".into(), 8888);
         let pairs = resolve_environment(&request, Some(&addr), None);
 
-        assert!(pairs
-            .iter()
-            .any(|(k, v)| k == "PATH" && v == DEFAULT_SANDBOX_PATH));
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| k == "PATH" && v == DEFAULT_SANDBOX_PATH)
+        );
         let proxies: Vec<_> = pairs
             .iter()
             .filter(|(k, _)| k == "HTTP_PROXY")

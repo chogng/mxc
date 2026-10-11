@@ -525,6 +525,11 @@ impl MxcPtyProcess {
         self.lock_process().try_wait()
     }
 
+    /// Interrupt the terminal's current foreground process group.
+    pub fn interrupt(&self) -> std::io::Result<()> {
+        self.lock_process().pty_interrupt()
+    }
+
     /// Kill the container process tree.
     pub fn kill(&self) -> std::io::Result<()> {
         self.lock_process().kill()

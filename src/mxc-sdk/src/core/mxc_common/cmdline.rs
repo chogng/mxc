@@ -89,7 +89,14 @@ pub fn cmdline_from_argv_for_context(
         }
         match context {
             CommandLineContext::WindowsCreateProcess => {
-                append_windows_create_process(&mut out, arg)
+                // Win32 accepts either separator in the executable path, but
+                // cmd.exe parses '/' in argv[0] as a command-line switch.
+                // Arguments retain their slashes, including shell switches.
+                if i == 0 {
+                    append_windows_create_process(&mut out, &arg.replace('/', "\\"));
+                } else {
+                    append_windows_create_process(&mut out, arg);
+                }
             }
             CommandLineContext::WindowsCommandProcessor => append_windows_cmd(&mut out, arg),
             CommandLineContext::PosixShell => append_posix_shell(&mut out, arg),
