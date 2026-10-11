@@ -103,6 +103,10 @@ fn embed_version_info_for_binary_windows(
     };
     let output = compiler
         .arg("/nologo")
+        // winresource writes UTF-8, including the copyright symbol. Neither
+        // the host ANSI codepage nor LLVM's default identifies that encoding.
+        .arg("/c")
+        .arg("65001")
         .arg(format!("/fo{}", compiled_path.display()))
         .arg(&resource_path)
         .output()?;

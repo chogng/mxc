@@ -207,6 +207,8 @@ fn policy_projection(request: &ExecutionRequest) -> Value {
         // External contract provenance is diagnostics/telemetry attribution,
         // not enforcement.
         source_contract: _excluded_source_contract,
+        // Host-resolved launcher location does not change sandbox policy.
+        bubblewrap_executable: _excluded_bubblewrap_executable,
         container_id,
         working_directory,
         script_timeout,
@@ -767,9 +769,11 @@ mod tests {
                 "backend authorization must not change {} policy identity",
                 changed.containment.wire_name()
             );
-            assert!(policy_projection(&changed)
-                .get("experimentalEnabled")
-                .is_none());
+            assert!(
+                policy_projection(&changed)
+                    .get("experimentalEnabled")
+                    .is_none()
+            );
         }
     }
 

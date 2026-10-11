@@ -15,24 +15,25 @@ use std::sync::Arc;
 
 use crate::learning_mode_core::DenialAnalyzer;
 use crate::learning_mode_windows::{EtlDenialAnalyzer, LearningModeApi, LearningModeError};
+use crate::mxc_common::mxc_error::{ApiFailure, MxcError};
+use windows::Win32::Foundation::ERROR_NOT_SUPPORTED;
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, SetHandleInformation, ERROR_CALL_NOT_IMPLEMENTED, E_NOTIMPL, HANDLE,
-    HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, E_NOTIMPL, ERROR_CALL_NOT_IMPLEMENTED, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+    SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
-    EXTENDED_STARTUPINFO_PRESENT, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, PROCESS_CREATION_FLAGS,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 use windows_core::{PCWSTR, PWSTR};
 
 use crate::mxc_common::api_set::is_api_set_implemented;
 use crate::mxc_common::audit::{
-    sanitize_identity, AuditEvent, AuditEventName, KillMethod, OperationStatus, TeardownSkipReason,
-    TeardownStatus,
+    AuditEvent, AuditEventName, KillMethod, OperationStatus, TeardownSkipReason, TeardownStatus,
+    sanitize_identity,
 };
 use crate::mxc_common::error::WxcError;
 use crate::mxc_common::log_symbols::EMOJI_SECTION;
@@ -42,17 +43,17 @@ use crate::mxc_common::models::{
     FailurePhase, SandboxOutputMetadata, ScriptResponse,
 };
 use crate::mxc_common::process_util::{
-    create_std_pipes, InterruptiblePipeReader, OwnedHandle, PipeReadCanceller, PipeWriter,
-    SendOwnedHandle,
+    InterruptiblePipeReader, OwnedHandle, PipeReadCanceller, PipeWriter, SendOwnedHandle,
+    create_std_pipes,
 };
 use crate::mxc_common::sandbox_process::{
-    boxed_closer, cancel_and_join_discard, duplicate_and_take_native_stdio, spawn_discard,
-    take_boxed_read, take_boxed_write, NativeStdio, SandboxBackend, SandboxProcess, StdioMode,
-    StreamCloser,
+    NativeStdio, SandboxBackend, SandboxProcess, StdioMode, StreamCloser, boxed_closer,
+    cancel_and_join_discard, duplicate_and_take_native_stdio, spawn_discard, take_boxed_read,
+    take_boxed_write,
 };
 use crate::mxc_common::script_runner::get_timeout_milliseconds;
 use crate::mxc_common::string_util;
-use crate::mxc_common::validator::{validate_network_policy_support, NetworkPolicySupport};
+use crate::mxc_common::validator::{NetworkPolicySupport, validate_network_policy_support};
 use crate::process_container_common::base_container_helpers::{
     build_psec_v1_security_environment_spec, has_conflicting_proxy_identity,
     unrestricted_host_loopback_allowed,
@@ -70,13 +71,13 @@ use crate::process_container_common::launch_diagnostics::{
 use crate::process_container_common::native_capture::CaptureSession;
 use crate::process_container_common::proxy_coordinator::ProxyCoordinator;
 use crate::process_container_common::secenv::{
-    self, ProcessSecurityEnvironment, SecurityEnvironmentStartupInfo, SecurityEnvironmentSupport,
-    SecurityEnvironmentVersion, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
-    SECURITY_ENVIRONMENT_API_SET,
+    self, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE, ProcessSecurityEnvironment,
+    SECURITY_ENVIRONMENT_API_SET, SecurityEnvironmentApi, SecurityEnvironmentStartupInfo,
+    SecurityEnvironmentSupport, SecurityEnvironmentVersion,
 };
 
 use windows::Win32::System::Threading::{
-    ResumeThread, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, ResumeThread,
 };
 
 /// Build the environment block handed to the contained child.
@@ -133,13 +134,11 @@ fn build_child_env_block(request: &ExecutionRequest) -> Result<Option<Vec<u16>>,
 
 const CAPTURE_API_AVAILABLE_LOG: &str =
     "captureDenials: learning-mode trace API available (processmodel.dll)";
-const PSEC_ENUMERATE_PATHS_UNSUPPORTED_MSG: &str =
-    "processContainer.filesystem.enumeratePaths requires Process Security Environment contract version 1.1 \
+const PSEC_ENUMERATE_PATHS_UNSUPPORTED_MSG: &str = "processContainer.filesystem.enumeratePaths requires Process Security Environment contract version 1.1 \
      and QueryProcessSecurityEnvironmentSupport to advertise PSE_SUPPORT_FS_ENUMERATE; this OS \
      build does not support that policy, and enumeration-only access cannot fall back to \
      AppContainer enforcement";
-const PSEC_INGRESS_UNSUPPORTED_MSG: &str =
-    "network.ingress.hostLoopback='allow' requires Process Security Environment contract version \
+const PSEC_INGRESS_UNSUPPORTED_MSG: &str = "network.ingress.hostLoopback='allow' requires Process Security Environment contract version \
      1.1 with ingress support";
 const CREATE_PROCESS_IN_SECURITY_ENVIRONMENT_API: &str =
     "CreateProcessW(PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT)";
@@ -182,6 +181,58 @@ impl std::error::Error for CaptureCleanupError {}
 /// enabled on this build (symbol present, capability gated off).
 fn is_api_not_implemented(err: u32) -> bool {
     err == ERROR_CALL_NOT_IMPLEMENTED.0 || err == E_NOTIMPL.0 as u32
+}
+
+fn hresult_from_win32(code: u32) -> u32 {
+    if code == 0 {
+        0
+    } else {
+        (code & 0x0000_ffff) | 0x8007_0000
+    }
+}
+
+fn psec_probe_error(error: LearningModeError) -> MxcError {
+    let unsupported = match &error {
+        LearningModeError::ApiSetUnavailable { .. } | LearningModeError::ExportMissing { .. } => {
+            true
+        }
+        LearningModeError::HResultCall { code, .. } => {
+            let code = *code as u32;
+            code == E_NOTIMPL.0 as u32
+                || code == hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0)
+                || code == hresult_from_win32(ERROR_NOT_SUPPORTED.0)
+        }
+        LearningModeError::ApiCall { code, .. } => {
+            *code == ERROR_CALL_NOT_IMPLEMENTED.0 || *code == ERROR_NOT_SUPPORTED.0
+        }
+        LearningModeError::DllLoad(_) | LearningModeError::InvalidInput { .. } => false,
+    };
+    let failure = match &error {
+        LearningModeError::ApiSetUnavailable { api_set, .. } => {
+            Some(ApiFailure::new(format!("IsApiSetImplemented({api_set})")))
+        }
+        LearningModeError::DllLoad(_) => Some(ApiFailure::new("LoadLibraryExW(processmodel.dll)")),
+        LearningModeError::ExportMissing { export, .. } => {
+            Some(ApiFailure::new(format!("GetProcAddress({export})")))
+        }
+        LearningModeError::HResultCall { function, code } => {
+            Some(ApiFailure::new(*function).with_native_code(format!("0x{:08X}", *code as u32)))
+        }
+        LearningModeError::ApiCall { function, code } => {
+            Some(ApiFailure::new(*function).with_native_code(code.to_string()))
+        }
+        LearningModeError::InvalidInput { .. } => None,
+    };
+    let message = error.to_string();
+    let mut result = if unsupported {
+        MxcError::unsupported_containment(message)
+    } else {
+        MxcError::backend_unavailable(message)
+    };
+    if let Some(failure) = failure {
+        result = result.with_api_failure(failure);
+    }
+    result
 }
 
 trait CaptureSessionOps {
@@ -264,6 +315,90 @@ impl Default for BaseContainerRunner {
 }
 
 impl BaseContainerRunner {
+    /// Verifies that PSEC can implement this exact request without starting the
+    /// user command. Confirmed missing capabilities return UnsupportedContainment;
+    /// API, resource and cleanup failures retain their operation and native code.
+    pub fn require_psec(request: &ExecutionRequest) -> Result<(), MxcError> {
+        if request.policy.least_privilege_mode {
+            return Err(MxcError::unsupported_containment(
+                "PSEC does not support the requested least-privilege process mode",
+            ));
+        }
+        if request.policy.network_proxy.is_enabled()
+            && !request.policy.runtime_network_proxy_specified
+        {
+            return Err(MxcError::unsupported_containment(
+                "PSEC requires the runtime proxy contract for proxied networking",
+            ));
+        }
+
+        let api = SecurityEnvironmentApi::load().map_err(psec_probe_error)?;
+        let proxy_loopback_workaround =
+            Self::psec_1_0_proxy_loopback_workaround(request, |version| {
+                api.supports_version(u32::from(version.major), u32::from(version.minor))
+            })
+            .map_err(psec_probe_error)?;
+        let version =
+            Self::choose_min_required_psec_version_for_request(request, proxy_loopback_workaround);
+        if !api
+            .supports_version(u32::from(version.major), u32::from(version.minor))
+            .map_err(psec_probe_error)?
+        {
+            return Err(MxcError::unsupported_containment(
+                "the required PSEC contract is unavailable",
+            ));
+        }
+        for (requested, capability, message) in [
+            (
+                !request.policy.denied_paths.is_empty(),
+                SecurityEnvironmentSupport::FileSystemDeny,
+                "PSEC cannot enforce the requested denied paths",
+            ),
+            (
+                !request.policy.enumerate_paths.is_empty(),
+                SecurityEnvironmentSupport::FileSystemEnumerate,
+                PSEC_ENUMERATE_PATHS_UNSUPPORTED_MSG,
+            ),
+            (
+                unrestricted_host_loopback_allowed(&request.policy) && !proxy_loopback_workaround,
+                SecurityEnvironmentSupport::NetworkIngress,
+                PSEC_INGRESS_UNSUPPORTED_MSG,
+            ),
+        ] {
+            if requested && !api.query_support(capability).map_err(psec_probe_error)? {
+                return Err(MxcError::unsupported_containment(message));
+            }
+        }
+        let ingress = version >= SecurityEnvironmentVersion::V1_1
+            && api
+                .query_support(SecurityEnvironmentSupport::NetworkIngress)
+                .map_err(psec_probe_error)?;
+        let specification = build_psec_v1_security_environment_spec(request, version, ingress);
+        if request.policy.capture_denials.is_some() {
+            let session =
+                CaptureSession::begin(&specification, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE)
+                    .map_err(psec_probe_error)?;
+            let startup = SecurityEnvironmentStartupInfo::new(
+                STARTUPINFOW::default(),
+                session.environment(),
+                &[],
+            );
+            let cleanup = session.finish(None);
+            // Both operations run before their results are returned, so failed
+            // startup preparation still closes the trace and environment.
+            startup.map(drop).map_err(psec_probe_error)?;
+            cleanup.map_err(psec_probe_error)?;
+            return Ok(());
+        }
+        let environment = api
+            .create(&specification, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE)
+            .map_err(psec_probe_error)?;
+        let startup =
+            SecurityEnvironmentStartupInfo::new(STARTUPINFOW::default(), environment.raw(), &[]);
+        environment.close();
+        startup.map(drop).map_err(psec_probe_error)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -670,19 +805,19 @@ impl BaseContainerRunner {
                 h_stdin = match unsafe { GetStdHandle(STD_INPUT_HANDLE) } {
                     Ok(h) => h,
                     Err(e) => {
-                        return Err(ScriptResponse::error(&format!("GetStdHandle(STDIN): {e}")))
+                        return Err(ScriptResponse::error(&format!("GetStdHandle(STDIN): {e}")));
                     }
                 };
                 h_stdout = match unsafe { GetStdHandle(STD_OUTPUT_HANDLE) } {
                     Ok(h) => h,
                     Err(e) => {
-                        return Err(ScriptResponse::error(&format!("GetStdHandle(STDOUT): {e}")))
+                        return Err(ScriptResponse::error(&format!("GetStdHandle(STDOUT): {e}")));
                     }
                 };
                 h_stderr = match unsafe { GetStdHandle(STD_ERROR_HANDLE) } {
                     Ok(h) => h,
                     Err(e) => {
-                        return Err(ScriptResponse::error(&format!("GetStdHandle(STDERR): {e}")))
+                        return Err(ScriptResponse::error(&format!("GetStdHandle(STDERR): {e}")));
                     }
                 };
 
@@ -874,50 +1009,48 @@ impl BaseContainerRunner {
                     .map(ProcessSecurityEnvironment::raw)
             })
             .expect("PSEC environment owner is initialized before launch");
-        let extended_startup =
-            match SecurityEnvironmentStartupInfo::new(si, environment_handle, &inherited_handles) {
-                Ok(startup) => startup,
-                Err(primary) => {
-                    let cleanup_error = capture_session
-                        .take()
-                        .map(|session| session.finish(None))
-                        .unwrap_or(Ok(()))
-                        .err();
-                    let mut msg =
-                        format!("failed to attach the process security environment: {primary}");
-                    if let Some(cleanup_error) = &cleanup_error {
-                        let _ = write!(
+        let extended_startup = match SecurityEnvironmentStartupInfo::new(
+            si,
+            environment_handle,
+            &inherited_handles,
+        ) {
+            Ok(startup) => startup,
+            Err(primary) => {
+                let cleanup_error = capture_session
+                    .take()
+                    .map(|session| session.finish(None))
+                    .unwrap_or(Ok(()))
+                    .err();
+                let mut msg =
+                    format!("failed to attach the process security environment: {primary}");
+                if let Some(cleanup_error) = &cleanup_error {
+                    let _ = write!(
                         msg,
                         "; additionally failed to discard the learning-mode trace: {cleanup_error}"
                     );
-                    }
-                    let _ = writeln!(logger, "Error: {msg}");
-                    log_base_network_policy_audit(
-                        request,
-                        &identity,
-                        OperationStatus::Failure,
-                        logger,
-                    );
-                    let failure_phase = if primary.is_api_unavailable()
-                        || cleanup_error.as_ref().is_some_and(
-                            crate::learning_mode_windows::LearningModeError::is_api_unavailable,
-                        ) {
-                        FailurePhase::BackendUnavailable
-                    } else {
-                        FailurePhase::LaunchFailed
-                    };
-                    if capture_denials.is_some() {
-                        self.cleanup_capture_begin_failure(logger);
-                    }
-                    return Err(ScriptResponse {
-                        exit_code: -1,
-                        error_message: msg.clone(),
-                        standard_err: msg,
-                        failure_phase,
-                        ..Default::default()
-                    });
                 }
-            };
+                let _ = writeln!(logger, "Error: {msg}");
+                log_base_network_policy_audit(request, &identity, OperationStatus::Failure, logger);
+                let failure_phase = if primary.is_api_unavailable()
+                    || cleanup_error.as_ref().is_some_and(
+                        crate::learning_mode_windows::LearningModeError::is_api_unavailable,
+                    ) {
+                    FailurePhase::BackendUnavailable
+                } else {
+                    FailurePhase::LaunchFailed
+                };
+                if capture_denials.is_some() {
+                    self.cleanup_capture_begin_failure(logger);
+                }
+                return Err(ScriptResponse {
+                    exit_code: -1,
+                    error_message: msg.clone(),
+                    standard_err: msg,
+                    failure_phase,
+                    ..Default::default()
+                });
+            }
+        };
         let environment = (!current_env_ptr.is_null()).then_some(current_env_ptr);
         let result = unsafe {
             CreateProcessW(
@@ -1069,8 +1202,7 @@ impl BaseContainerRunner {
                 }
                 self.proxy_coordinator.stop(logger);
 
-                const JOB_SETUP_FAILED_MSG: &str =
-                    "BaseContainer sandbox could not be placed in a job object, so it \
+                const JOB_SETUP_FAILED_MSG: &str = "BaseContainer sandbox could not be placed in a job object, so it \
                      could not be reliably terminated; the launch was rejected to \
                      avoid running an uncontainable sandbox.";
                 let mut extended_error = format!("BaseContainer job-object setup failed: {e}");
@@ -3144,11 +3276,12 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            assert!(!BaseContainerRunner::psec_1_0_proxy_loopback_workaround(
-                &request,
-                |_| panic!("ineligible policy must not query the OS"),
-            )
-            .unwrap());
+            assert!(
+                !BaseContainerRunner::psec_1_0_proxy_loopback_workaround(&request, |_| panic!(
+                    "ineligible policy must not query the OS"
+                ),)
+                .unwrap()
+            );
         }
     }
 
@@ -3184,11 +3317,12 @@ mod tests {
         let spec = psec_layout::root_as_process_security_environment(&bytes).unwrap();
         let network = spec.network_policy().unwrap();
         assert_eq!(spec.version().minor(), 0);
-        assert!(spec
-            .capabilities()
-            .unwrap()
-            .split(',')
-            .any(|capability| capability == "networkLoopback"));
+        assert!(
+            spec.capabilities()
+                .unwrap()
+                .split(',')
+                .any(|capability| capability == "networkLoopback")
+        );
         assert_eq!(
             network.allowed_appcontainer_peer(),
             Some(crate::process_container_common::base_container_helpers::LOOPBACK_NETWORK_PEER)
@@ -3616,3 +3750,7 @@ mod tests {
     // BaseContainer native-PSEC exception) is exercised as a consolidated
     // matrix in `crate::guarded_capture`'s tests, so it is not duplicated here.
 }
+
+#[cfg(test)]
+#[path = "psec_tests.rs"]
+mod psec_tests;

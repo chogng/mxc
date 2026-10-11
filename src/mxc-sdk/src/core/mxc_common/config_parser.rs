@@ -1167,6 +1167,8 @@ fn make_seatbelt_config(sb: wire::Seatbelt) -> SeatbeltConfig {
         extra_mach_lookups,
     } = sb;
     SeatbeltConfig {
+        allow_unix_sockets: true,
+        allowed_unix_socket_paths: Vec::new(),
         profile_override,
         gui_access: gui_access.unwrap_or(false),
         launch_method: launch_method.map(Into::into).unwrap_or_default(),
@@ -1599,6 +1601,7 @@ fn normalize_common_request_ir(
     }
 
     Ok(ExecutionRequest {
+        bubblewrap_executable: None,
         source_contract: Some(source_contract),
         container_id,
         env,
@@ -2966,9 +2969,7 @@ mod tests {
                 })),
             ),
         ] {
-            let path = repository_root()
-                .join("tests")
-                .join("configs")
+            let path = repository_root().join("tests").join("configs")
                 .join(fixture);
             let json = fs::read_to_string(&path).unwrap();
             let encoded = base64_encode(json.as_bytes());
