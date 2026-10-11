@@ -50,10 +50,14 @@ pub const PROXY_ENV_KEYS: &[&str] = &[
     "HTTPS_PROXY",
     "ALL_PROXY",
     "FTP_PROXY",
+    "WS_PROXY",
+    "WSS_PROXY",
     "http_proxy",
     "https_proxy",
     "all_proxy",
     "ftp_proxy",
+    "ws_proxy",
+    "wss_proxy",
     "NO_PROXY",
     "no_proxy",
 ];
@@ -68,10 +72,14 @@ pub const PROXY_SET_KEYS: &[&str] = &[
     "HTTPS_PROXY",
     "ALL_PROXY",
     "FTP_PROXY",
+    "WS_PROXY",
+    "WSS_PROXY",
     "http_proxy",
     "https_proxy",
     "all_proxy",
     "ftp_proxy",
+    "ws_proxy",
+    "wss_proxy",
 ];
 
 /// Proxy env var keys that [`apply_cooperative_proxy_env`] sets to the *empty
@@ -296,8 +304,29 @@ pub fn apply_cooperative_proxy_env(caller_env: &[String], proxy_url: &str) -> Ve
         .cloned()
         .collect();
 
+    let all_proxy = caller_env
+        .iter()
+        .filter_map(|entry| entry.split_once('='))
+        .find(|(key, _)| key.eq_ignore_ascii_case("ALL_PROXY"))
+        .and_then(|(_, value)| url::Url::parse(value).ok())
+        .filter(|url| matches!(url.scheme(), "socks5" | "socks5h"))
+        .and_then(|url| {
+            let target = url::Url::parse(proxy_url).ok()?;
+            Some(format!(
+                "{}://{}:{}",
+                url.scheme(),
+                target.host_str()?,
+                target.port_or_known_default()?
+            ))
+        })
+        .unwrap_or_else(|| proxy_url.to_owned());
     for key in PROXY_SET_KEYS {
-        effective.push(format!("{key}={proxy_url}"));
+        let value = if key.eq_ignore_ascii_case("ALL_PROXY") {
+            &all_proxy
+        } else {
+            proxy_url
+        };
+        effective.push(format!("{key}={value}"));
     }
 
     // Neutralize any inherited NO_PROXY: WSLc merges over the image's ENV, so

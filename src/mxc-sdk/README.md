@@ -66,6 +66,27 @@ directional policy. For existing-container execution, `ExecutionRequest.network`
 is a runtime-only `ProcessNetworkPolicy`; it cannot change provision-time
 policy.
 
+## Restricted process launches
+
+`v1::prepare_restricted` accepts the ordinary typed `ContainerRequest` plus
+host-owned `RestrictedLaunchOptions`. It prepares the platform process backend
+without starting the workload. Windows requires PSEC and prohibits host ACL
+mutation; missing policy capabilities are reported before execution, and launch
+failures never retry a different backend. Other container types are rejected.
+
+The returned `RestrictedLaunch` exposes `spawn`, `spawn_with_pty`, and
+`spawn_inherited`. These return the ordinary SDK process handles. The inherited
+variant supports an application-owned Windows ConPTY helper; ProcessContainer
+still cannot allocate a terminal itself. `MxcPtyProcess::interrupt` signals the
+current foreground terminal job rather than the initial shell's process group.
+
+Runtime options carry a trusted Bubblewrap executable, private Unix socket
+paths, and application-compiled Seatbelt deny rules. They are not deserialized
+from workload configuration. The SDK owns baseline profile generation and
+resource cleanup; the caller owns permission decisions, path identity checks,
+execution budgets, and output draining. Additional denials cannot extend a
+profile override.
+
 ## Lifecycle API
 
 Typed lifecycle operations are available under `v1`. `ProvisionRequest`

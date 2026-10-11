@@ -205,6 +205,11 @@ pub trait SandboxProcess: Send {
         ))
     }
 
+    /// Interrupt the terminal's foreground process group without terminating its session.
+    fn pty_interrupt(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "this sandbox process has no PTY interrupt support"))
+    }
+
     /// Resize the pseudo-terminal.
     fn pty_resize(&self, _size: PtySize) -> std::io::Result<()> {
         Err(std::io::Error::new(
@@ -1009,6 +1014,10 @@ mod runner_tests {
 }
 
 #[cfg(all(test, unix))]
+#[path = "sandbox_process_tests.rs"]
+mod exit_observation_tests;
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::{wait_with_timeout, WaitError};
     use std::process::Command;
@@ -1066,5 +1075,25 @@ mod tests {
             Err(_) => panic!("blocking wait must return the exit status"),
         };
         assert!(status.success());
+    }
+}
+
+/// Observes a Unix child without releasing its PID. Only wait may reap the process.
+#[cfg(unix)]
+pub fn poll_child_exit(child: &std::process::Child) -> std::io::Result<Option<i32>> {
+    use rustix::process::Pid;
+    use rustix::process::WaitId;
+    use rustix::process::WaitIdOptions;
+    use rustix::process::waitid;
+
+    loop {
+        match waitid(
+            WaitId::Pid(Pid::from_child(child)),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(status) => return Ok(status.map(|status| status.exit_status().unwrap_or(-1))),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
     }
 }

@@ -29,7 +29,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::mxc_common::filesystem_resolve::{resolve_path_plan, FsIntent};
+use crate::mxc_common::filesystem_resolve::{FsIntent, resolve_path_plan};
 use crate::mxc_common::host_is_canonical_loopback;
 use crate::mxc_common::models::{ClipboardPolicy, ContainerPolicy, ExecutionRequest, ProxyAddress};
 use crate::seatbelt_common::seatbelt_policy;
@@ -85,8 +85,32 @@ pub fn build_profile_with_proxy(
     write_extra_seatbelt_rules(&mut out, request);
     write_ui_rules(&mut out, request);
 
+    if request
+        .seatbelt
+        .as_ref()
+        .is_some_and(|config| !config.allow_unix_sockets)
+    {
+        let allowed = request
+            .seatbelt
+            .as_ref()
+            .expect("restricted Unix socket policy has Seatbelt configuration")
+            .allowed_unix_socket_paths
+            .iter()
+            .map(|path| resolve_policy_path(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        if allowed.is_empty() {
+            out.push_str("(deny network-bind network-outbound (subpath \"/\"))\n");
+        } else {
+            out.push_str("(deny network-bind network-outbound (require-all (subpath \"/\")");
+            for path in allowed {
+                let _ = write!(out, " (require-not (subpath {}))", quote_scheme(&path));
+            }
+            out.push_str("))\n");
+        }
+    }
     // Policy-derived deny rules go LAST so they win on conflict.
     write_filesystem_deny(&mut out, &resolved);
+    write_filesystem_boundaries(&mut out, &resolved);
 
     Ok(out)
 }
@@ -103,7 +127,11 @@ const BASELINE_ALLOW: &str = "\
 (allow signal (target same-sandbox))
 (allow sysctl-read)
 (allow file-read-metadata)
+;; confstr's DARWIN_USER_CACHE_DIR needs dirhelper. Without it, Xcode
+;; rebuilds runtime discovery on every invocation instead of finding its cache.
+;; This lookup does not grant writes to the shared cache or temporary directory.
 (allow mach-lookup
+    (global-name \"com.apple.bsd.dirhelper\")
     (global-name \"com.apple.system.notification_center\")
     (global-name \"com.apple.system.logger\")
     (global-name \"com.apple.distributed_notifications@Uv3\")
@@ -288,7 +316,7 @@ impl ResolvedPaths {
         let readonly = resolve_all(&policy.readonly_paths)?;
         let mut readwrite = resolve_all(&policy.readwrite_paths)?;
 
-        // `denied` is emitted last and would override either allow anyway, but
+        // An exact denied path overrides either grant, so
         // dropping the path keeps the emitted profile an honest description of
         // the effective policy.
         let mut readonly: Vec<String> = readonly;
@@ -318,8 +346,8 @@ fn write_filesystem_allow(out: &mut String, paths: &ResolvedPaths) {
     // makes the *deepest* intent win at every path — a `readonlyPaths` entry
     // nested inside a broader `readwritePaths` subtree stays read-only rather
     // than inheriting the parent's write grant. `deniedPaths` is deliberately
-    // not part of this plan: it is emitted last so it outranks these filtered
-    // allows regardless of depth.
+    // emitted separately so a denied ancestor can exclude explicit deeper grants,
+    // matching the specificity ordering used by the other filesystem backends.
     out.push_str(";; --- policy.readonlyPaths / policy.readwritePaths (shallow-to-deep) ---\n");
     for mount in resolve_path_plan(&paths.readwrite, &paths.readonly, &[]) {
         let subpath = [mount.path.clone()];
@@ -375,11 +403,64 @@ fn write_filesystem_deny(out: &mut String, paths: &ResolvedPaths) {
         // that only reaches it through the wildcard. Without it a denied path
         // still answers `stat()` with its real size and timestamps.
         out.push_str(";; --- policy.deniedPaths (override broader allow rules) ---\n");
-        write_path_rule(
+        for hidden in &paths.denied {
+            let exceptions = paths
+                .readonly
+                .iter()
+                .chain(&paths.readwrite)
+                .filter(|path| *path != hidden && std::path::Path::new(path).starts_with(hidden))
+                .collect::<Vec<_>>();
+            if exceptions.is_empty() {
+                write_path_rule(
+                    out,
+                    "deny file-read* file-read-metadata file-write* network-bind network-outbound",
+                    &[hidden.clone()],
+                );
+            } else {
+                let _ = write!(
+                    out,
+                    "(deny file-read* file-read-metadata file-write* network-bind network-outbound (require-all (subpath {})",
+                    quote_scheme(hidden)
+                );
+                for path in exceptions {
+                    let _ = write!(out, " (require-not (subpath {}))", quote_scheme(path));
+                }
+                out.push_str("))\n");
+            }
+        }
+    }
+}
+
+/// Keep authority roots and protected descendants at their policy pathnames.
+/// A read/write deny on a child alone does not prevent renaming its writable
+/// ancestor, which would move the child outside that pathname restriction.
+fn write_filesystem_boundaries(out: &mut String, paths: &ResolvedPaths) {
+    let mut anchors = std::collections::BTreeSet::new();
+    for root in &paths.readwrite {
+        if root != "/" {
+            anchors.insert(root.clone());
+        }
+    }
+    for path in paths.readonly.iter().chain(&paths.denied) {
+        for ancestor in Path::new(path).ancestors().skip(1) {
+            anchors.insert(ancestor.to_string_lossy().into_owned());
+        }
+    }
+    for path in anchors {
+        let _ = writeln!(
             out,
-            "deny file-read* file-read-metadata file-write* network-bind network-outbound",
-            &paths.denied,
+            "(deny file-write-unlink (require-all (vnode-type DIRECTORY) (literal {})))",
+            quote_scheme(&path)
         );
+    }
+    // These selectors mutate files through read-only descriptors; file-write*
+    // does not cover them, even under deny-default. Full disk write without
+    // carveouts retains its explicitly unrestricted behavior.
+    if !paths.readwrite.iter().any(|path| path == "/")
+        || !paths.readonly.is_empty()
+        || !paths.denied.is_empty()
+    {
+        out.push_str("(deny system-fcntl (fcntl-command 80 110))\n");
     }
 }
 
@@ -1423,6 +1504,24 @@ mod tests {
     }
 
     #[test]
+    fn restricted_unix_sockets_reopen_only_the_execution_private_directory() {
+        let mut r = req();
+        r.policy.readwrite_paths = vec!["/tmp/work".into(), "/tmp/ash-exec".into()];
+        r.seatbelt = Some(SeatbeltConfig {
+            allow_unix_sockets: false,
+            allowed_unix_socket_paths: vec!["/tmp/ash-exec".into()],
+            ..Default::default()
+        });
+
+        let profile = build_profile(&r).unwrap();
+
+        assert!(profile.contains(
+            "(deny network-bind network-outbound (require-all (subpath \"/\") (require-not (subpath \"/private/tmp/ash-exec\"))))"
+        ));
+        assert!(profile.contains("(subpath \"/private/tmp/work\")"));
+    }
+
+    #[test]
     fn denied_paths_deny_outbound_under_default_allow() {
         // `egress.default: allow` emits a bare `(allow network-outbound)`, which
         // on its own grants AF_UNIX `connect()`. A denied subtree must still
@@ -2061,7 +2160,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_link_the_caller_controls_is_not_trusted() {
-        use std::os::unix::fs::{symlink, MetadataExt as _};
+        use std::os::unix::fs::{MetadataExt as _, symlink};
 
         let dir = std::env::temp_dir().join(format!("mxc-devdir-trust-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -2110,3 +2209,7 @@ mod tests {
         assert!(p.contains(&format!("(subpath \"{}\")", granted.display())));
     }
 }
+
+#[cfg(test)]
+#[path = "profile_security_tests.rs"]
+mod security_tests;

@@ -32,3 +32,6 @@ pub(crate) mod provider_monitor;
 /// crate; every other item stays `pub(crate)`.
 #[cfg(target_os = "linux")]
 pub mod proxy_network;
+
+#[cfg(target_os = "linux")]
+mod seccomp;

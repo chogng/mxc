@@ -203,6 +203,7 @@ pub use core_modules::process_security_environment_spec;
 
 mod configs;
 mod options;
+mod restricted;
 mod policy;
 mod sandbox;
 mod state_aware_sdk;
@@ -297,6 +298,12 @@ pub mod v1 {
             )?)
         }
     }
+
+    pub use crate::mxc_common::cmdline::{cmdline_from_argv_for_context, CommandLineContext};
+    pub use crate::mxc_common::filesystem_object::{
+        compare_existing_filesystem_objects, ExistingObjectComparison,
+    };
+    pub use crate::restricted::{prepare_restricted, RestrictedLaunch, RestrictedLaunchOptions};
 
     pub use crate::policy::{
         ClipboardPolicy, ContainerRequest, Containment, FilesystemPolicy, NetworkAction,

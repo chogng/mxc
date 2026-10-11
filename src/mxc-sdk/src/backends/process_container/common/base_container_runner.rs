@@ -17,6 +17,8 @@ use crate::learning_mode_core::{capture_diagnostics::CaptureAnalysis, AnalyzeErr
 use crate::learning_mode_windows::{
     EtlDenialAnalyzer, LearningModeApi, LearningModeError, LearningModeTraceSources,
 };
+use crate::mxc_common::mxc_error::{ApiFailure, MxcError};
+use windows::Win32::Foundation::ERROR_NOT_SUPPORTED;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, SetHandleInformation, ERROR_CALL_NOT_IMPLEMENTED, E_NOTIMPL, HANDLE,
     HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -72,7 +74,7 @@ use crate::process_container_common::native_capture::CaptureSession;
 use crate::process_container_common::proxy_coordinator::ProxyCoordinator;
 use crate::process_container_common::secenv::{
     self, ProcessSecurityEnvironment, SecurityEnvironmentStartupInfo, SecurityEnvironmentSupport,
-    SecurityEnvironmentVersion, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
+    SecurityEnvironmentVersion, SecurityEnvironmentApi, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
     SECURITY_ENVIRONMENT_API_SET,
 };
 
@@ -192,6 +194,58 @@ fn is_api_not_implemented(err: u32) -> bool {
     err == ERROR_CALL_NOT_IMPLEMENTED.0 || err == E_NOTIMPL.0 as u32
 }
 
+fn hresult_from_win32(code: u32) -> u32 {
+    if code == 0 {
+        0
+    } else {
+        (code & 0x0000_ffff) | 0x8007_0000
+    }
+}
+
+fn psec_probe_error(error: LearningModeError) -> MxcError {
+    let unsupported = match &error {
+        LearningModeError::ApiSetUnavailable { .. } | LearningModeError::ExportMissing { .. } => {
+            true
+        }
+        LearningModeError::HResultCall { code, .. } => {
+            let code = *code as u32;
+            code == E_NOTIMPL.0 as u32
+                || code == hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0)
+                || code == hresult_from_win32(ERROR_NOT_SUPPORTED.0)
+        }
+        LearningModeError::ApiCall { code, .. } => {
+            *code == ERROR_CALL_NOT_IMPLEMENTED.0 || *code == ERROR_NOT_SUPPORTED.0
+        }
+        LearningModeError::DllLoad(_) | LearningModeError::InvalidInput { .. } => false,
+    };
+    let failure = match &error {
+        LearningModeError::ApiSetUnavailable { api_set, .. } => {
+            Some(ApiFailure::new(format!("IsApiSetImplemented({api_set})")))
+        }
+        LearningModeError::DllLoad(_) => Some(ApiFailure::new("LoadLibraryExW(processmodel.dll)")),
+        LearningModeError::ExportMissing { export, .. } => {
+            Some(ApiFailure::new(format!("GetProcAddress({export})")))
+        }
+        LearningModeError::HResultCall { function, code } => {
+            Some(ApiFailure::new(*function).with_native_code(format!("0x{:08X}", *code as u32)))
+        }
+        LearningModeError::ApiCall { function, code } => {
+            Some(ApiFailure::new(*function).with_native_code(code.to_string()))
+        }
+        LearningModeError::InvalidInput { .. } => None,
+    };
+    let message = error.to_string();
+    let mut result = if unsupported {
+        MxcError::unsupported_containment(message)
+    } else {
+        MxcError::backend_unavailable(message)
+    };
+    if let Some(failure) = failure {
+        result = result.with_api_failure(failure);
+    }
+    result
+}
+
 trait CaptureSessionOps {
     fn environment(&self) -> HANDLE;
     fn finish(
@@ -281,6 +335,84 @@ impl Default for BaseContainerRunner {
 }
 
 impl BaseContainerRunner {
+    /// Verifies that PSEC can implement this exact request without starting the
+    /// user command. Confirmed missing capabilities return UnsupportedContainment;
+    /// API, resource and cleanup failures retain their operation and native code.
+    pub fn require_psec(request: &ExecutionRequest) -> Result<(), MxcError> {
+        if request.policy.least_privilege_mode {
+            return Err(MxcError::unsupported_containment(
+                "PSEC does not support the requested least-privilege process mode",
+            ));
+        }
+        if request.policy.network_proxy.is_enabled()
+            && !request.policy.runtime_network_proxy_specified
+        {
+            return Err(MxcError::unsupported_containment(
+                "PSEC requires the runtime proxy contract for proxied networking",
+            ));
+        }
+
+        let api = SecurityEnvironmentApi::load().map_err(psec_probe_error)?;
+        let version = Self::choose_min_required_psec_version_for_request(request);
+        if !api
+            .supports_version(u32::from(version.major), u32::from(version.minor))
+            .map_err(psec_probe_error)?
+        {
+            return Err(MxcError::unsupported_containment(
+                "the required PSEC contract is unavailable",
+            ));
+        }
+        for (requested, capability, message) in [
+            (
+                !request.policy.denied_paths.is_empty(),
+                SecurityEnvironmentSupport::FileSystemDeny,
+                "PSEC cannot enforce the requested denied paths",
+            ),
+            (
+                !request.policy.enumerate_paths.is_empty(),
+                SecurityEnvironmentSupport::FileSystemEnumerate,
+                PSEC_ENUMERATE_PATHS_UNSUPPORTED_MSG,
+            ),
+        ] {
+            if requested && !api.query_support(capability).map_err(psec_probe_error)? {
+                return Err(MxcError::unsupported_containment(message));
+            }
+        }
+        let capture_network_decisions = if request.policy.capture_denials.is_some() {
+            LearningModeApi::load()
+                .map_err(psec_probe_error)?
+                .trace_sources()
+                .includes_network()
+        } else {
+            false
+        };
+        let specification =
+            build_psec_v1_security_environment_spec(request, version, capture_network_decisions);
+        if request.policy.capture_denials.is_some() {
+            let session =
+                CaptureSession::begin(&specification, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE)
+                    .map_err(psec_probe_error)?;
+            let startup = SecurityEnvironmentStartupInfo::new(
+                STARTUPINFOW::default(),
+                session.environment(),
+                &[],
+            );
+            let cleanup = session.finish(None);
+            // Both operations run before their results are returned, so failed
+            // startup preparation still closes the trace and environment.
+            startup.map(drop).map_err(psec_probe_error)?;
+            cleanup.map_err(psec_probe_error)?;
+            return Ok(());
+        }
+        let environment = api
+            .create(&specification, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE)
+            .map_err(psec_probe_error)?;
+        let startup =
+            SecurityEnvironmentStartupInfo::new(STARTUPINFOW::default(), environment.raw(), &[]);
+        environment.close();
+        startup.map(drop).map_err(psec_probe_error)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -3659,3 +3791,7 @@ mod tests {
     // BaseContainer native-PSEC exception) is exercised as a consolidated
     // matrix in `crate::guarded_capture`'s tests, so it is not duplicated here.
 }
+
+#[cfg(test)]
+#[path = "psec_tests.rs"]
+mod psec_tests;
